@@ -47,7 +47,9 @@ export function mountOrbe(board: HTMLElement, ctx: OrbeCtx) {
   };
   sh.addEventListener('pointerup', up); sh.addEventListener('pointercancel', up);
   sh.addEventListener('keydown', e => {
-    if ((e.key === 'Enter' || e.key === ' ') && e.target === sh) { e.preventDefault(); menu = !menu; render(); }
+    // con una tarjeta abierta, Enter o Espacio no la cambian por el menú (se perdería lo elegido en una pregunta)
+    if ((e.key === 'Enter' || e.key === ' ') && e.target === sh && state !== 'p' && state !== 't') { e.preventDefault(); menu = !menu; render(); }
+    if (e.key === 'Escape' && state === 'p' && !menu) { e.preventDefault(); ctx.islandFocus(false); }
     if (e.key === 'Escape' && menu) { e.preventDefault(); menu = false; render(); }
   });
   sh.addEventListener('click', e => {
@@ -66,6 +68,8 @@ export function mountOrbe(board: HTMLElement, ctx: OrbeCtx) {
   const bead = (k: ReturnType<typeof orbDot>) => `<div class="o-bead">${k === 'moon' ? '<span class="ms">dark_mode</span>' : `<span class="dot ${k === 'none' ? 'calm' : k}"></span>`}</div>`;
   function render() {
     const s = ctx.snap(), cfg = ctx.cfg(), n = ctx.notice(), now = Date.now(), top = s.pending[0];
+    // "Lugar del Orbe" cambiado en Mosaico: se mueve ya. morph() no ve un cambio de lado, así que la zona de clics se manda aquí.
+    if (!down && cfg.island.orb_side !== side) { side = cfg.island.orb_side; place(); ctx.hitbox(sh); }
     const allMuted = s.sessions.length > 0 && s.sessions.every(x => x.muted_until_ms > now);
     let html: string, sig: string, stacked = false;
     const o: MorphOpts = { radius: (_w, h) => h <= 26 ? '12px' : h > 44 ? '14px' : '10px' };
@@ -83,6 +87,7 @@ export function mountOrbe(board: HTMLElement, ctx: OrbeCtx) {
       sig = 'h' + statusLine(s) + s.focus + s.deferred.length + s.sessions.map(x => x.state).join('');
     }
     else { const k = orbDot(s); html = bead(k); sig = 'c' + k; }
+    ctx.shown(top && !menu && top.kind === 'permission' ? top.id : null);
     sh.dataset.k = sig.startsWith('c') ? 'dot' : 'open';
     state = sig[0];
     // es botón solo como punto o resumen; abierto contiene botones propios que el lector de pantalla debe alcanzar
@@ -99,7 +104,11 @@ export function mountOrbe(board: HTMLElement, ctx: OrbeCtx) {
     });
   }
   return {
-    render, openMenu() { menu = true; ctx.islandFocus(true); render(); requestAnimationFrame(() => sh.querySelector<HTMLElement>('.o-btn')?.focus()); },
+    render, openMenu() {
+      // Ctrl+Alt+Espacio o «Responder permiso» con algo esperando: el teclado va a esa tarjeta, no al menú que la taparía
+      if (ctx.snap().pending.length) { menu = false; ctx.islandFocus(true); render(); requestAnimationFrame(() => sh.querySelector<HTMLElement>('.layer:last-child :is(.qopt, .cmd)')?.focus({ preventScroll: true })); return; }
+      menu = true; ctx.islandFocus(true); render(); requestAnimationFrame(() => sh.querySelector<HTMLElement>('.o-btn')?.focus());
+    },
     light(kind: string) {
       const r = sh.getBoundingClientRect(), b = board.getBoundingClientRect(), c = (COLORS as Record<string, string>)[kind] || COLORS.start;
       beam(board, c, r.left - b.left + r.width / 2, ctx.cfg().island.beam);

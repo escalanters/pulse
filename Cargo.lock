@@ -2672,6 +2672,9 @@ name = "pulse-app"
 version = "0.1.0"
 dependencies = [
  "dirs 5.0.1",
+ "gdkx11",
+ "gtk",
+ "libc",
  "pulse-protocol",
  "rodio",
  "serde",
@@ -2682,6 +2685,7 @@ dependencies = [
  "tokio",
  "ureq",
  "windows-sys 0.59.0",
+ "x11",
 ]
 
 [[package]]

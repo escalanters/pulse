@@ -4,7 +4,8 @@
 
 /* ---------- piezas compartidas ---------- */
 .glass { background: var(--surface); box-shadow: inset 0 0 0 1px var(--line), inset 0 1px 0 var(--hi), 0 28px 56px -16px var(--shadow) }
-.shell { position: absolute; z-index: 6; overflow: hidden; color: var(--tx); font-size: 13px; line-height: 1.4 }
+/* clip y no hidden: una caja clip no se desplaza, así enfocar el campo o resaltar una fila mientras crece no sube el contenido */
+.shell { position: absolute; z-index: 6; overflow: hidden; overflow: clip; color: var(--tx); font-size: 13px; line-height: 1.4 }
 /* varios permisos: dos tarjetas apiladas asoman por debajo (spec §3.3) */
 .shell.stacked { box-shadow: inset 0 0 0 1px var(--line), inset 0 1px 0 var(--hi), 0 6px 0 -3px var(--raised), 0 6px 0 -2px var(--line), 0 12px 0 -6px color-mix(in srgb, var(--raised) 70%, transparent), 0 28px 56px -16px var(--shadow) }
 .layer { position: absolute; left: 0; top: 0; width: max-content; max-width: 520px }
@@ -134,3 +135,8 @@
 @media (prefers-reduced-motion: reduce) { .c-moon, .o-bead .ms { animation: none } }
 .qleft.urgent { justify-self: start; transform-origin: left center }
 @media (prefers-reduced-motion: reduce) { .o-btn:active, .qopt:active { transform: none } }
+
+/* Ctrl + arrastrar: la isla se mueve con el cursor */
+body.moving, body.moving * { cursor: grabbing !important; user-select: none }
+/* WebKitGTK anterior a 2.48 ignora scrollbar-width */
+.cmd::-webkit-scrollbar, .pal-list::-webkit-scrollbar { display: none }

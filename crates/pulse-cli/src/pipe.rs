@@ -1,33 +1,111 @@
-use std::{fs::{File, OpenOptions}, io::{BufRead, BufReader, Write}, path::Path, process::{Command, Stdio}, sync::mpsc, thread, time::{Duration, Instant}};
+use std::{io::{BufRead, BufReader, Write}, path::Path, process::{Command, Stdio}, sync::mpsc, thread, time::{Duration, Instant}};
 
-const ERROR_FILE_NOT_FOUND: i32 = 2;
-const ERROR_PIPE_BUSY: i32 = 231;
-const DETACHED_PROCESS: u32 = 0x0000_0008;
-const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+#[cfg(windows)] type Conn = std::fs::File;
+#[cfg(unix)] type Conn = std::os::unix::net::UnixStream;
 
-fn try_open(pipe: &str) -> std::io::Result<File> { OpenOptions::new().read(true).write(true).open(pipe) }
+/// Qué pasó al intentar conectar.
+#[cfg_attr(unix, allow(dead_code))]   // `Busy` solo existe con named pipes
+enum Try { Ok(Conn), NoServer, Busy, Err(String) }
+
+#[cfg(windows)]
+fn try_open(pipe: &str) -> Try {
+    const ERROR_FILE_NOT_FOUND: i32 = 2;
+    const ERROR_PIPE_BUSY: i32 = 231;
+    match std::fs::OpenOptions::new().read(true).write(true).open(pipe) {
+        Ok(f) => Try::Ok(f),
+        Err(e) if e.raw_os_error() == Some(ERROR_FILE_NOT_FOUND) => Try::NoServer,
+        Err(e) if e.raw_os_error() == Some(ERROR_PIPE_BUSY) => Try::Busy,
+        Err(e) => Try::Err(e.to_string()),
+    }
+}
+
+/// Sin el archivo del socket, o con uno viejo que ya nadie escucha: no hay servidor.
+#[cfg(unix)]
+fn try_open(path: &str) -> Try {
+    use std::io::ErrorKind::{ConnectionRefused, NotFound};
+    match Conn::connect(path) {
+        Ok(s) => Try::Ok(s),
+        Err(e) if matches!(e.kind(), NotFound | ConnectionRefused) => Try::NoServer,
+        Err(e) => Try::Err(e.to_string()),
+    }
+}
+
+#[cfg(windows)]
+fn detach(c: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    c.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+}
+
+/// Grupo de procesos propio: la app sigue viva aunque Claude Code mate al hook o se cierre la terminal.
+#[cfg(unix)]
+fn detach(c: &mut Command) { use std::os::unix::process::CommandExt; c.process_group(0); }
+
+/// Salida de la app a `~/.claude/pulse/app.log`: si no arranca (falta una librería, GTK sin pantalla, un pánico), ahí queda por qué.
+/// Pasado 1 MB se empieza de nuevo.
+fn app_log() -> Stdio {
+    let Some(dir) = pulse_protocol::data_dir() else { return Stdio::null() };
+    let _ = std::fs::create_dir_all(&dir);
+    let p = dir.join("app.log");
+    if std::fs::metadata(&p).is_ok_and(|m| m.len() > 1_000_000) { let _ = std::fs::File::create(&p); }
+    std::fs::OpenOptions::new().create(true).append(true).open(p).map(Stdio::from).unwrap_or_else(|_| Stdio::null())
+}
+
+/// Una terminal de un snap (VS Code instalado con snap) deja en el entorno rutas de GTK de su propio runtime; la app las
+/// heredaba y GTK no arrancaba ("symbol lookup error"). Se vuelve a lo que había antes del snap, o se quitan.
+#[cfg(unix)]
+fn clean_env(c: &mut Command) {
+    const VARS: [&str; 11] = ["GTK_PATH", "GTK_EXE_PREFIX", "GTK_IM_MODULE_FILE", "GIO_MODULE_DIR", "GDK_PIXBUF_MODULE_FILE", "GDK_PIXBUF_MODULEDIR",
+        "GSETTINGS_SCHEMA_DIR", "LOCPATH", "XDG_DATA_DIRS", "XDG_CONFIG_DIRS", "LD_LIBRARY_PATH"];
+    let orig = |v: &str| std::env::var_os(format!("{v}_VSCODE_SNAP_ORIG"));
+    if std::env::var_os("SNAP").is_none() && !VARS.iter().any(|v| orig(v).is_some()) { return; }
+    for v in VARS { match orig(v) { Some(o) if !o.is_empty() => { c.env(v, o); } _ => { c.env_remove(v); } } }
+}
+#[cfg(windows)] fn clean_env(_: &mut Command) {}
+
+/// Cuándo se lanzó la app por última vez (fecha del archivo `~/.claude/pulse/launch`).
+fn last_launch() -> Option<Duration> {
+    let p = pulse_protocol::data_dir()?.join("launch");
+    std::fs::metadata(p).ok()?.modified().ok()?.elapsed().ok()
+}
 
 fn spawn_app(app: &Path) -> Result<(), String> {
-    use std::os::windows::process::CommandExt;
-    Command::new(app).creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
-        .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null())
+    if let Some(d) = pulse_protocol::data_dir() { let _ = std::fs::create_dir_all(&d); let _ = std::fs::File::create(d.join("launch")); }
+    let mut c = Command::new(app);
+    detach(&mut c);
+    clean_env(&mut c);
+    // en `/`: con la carpeta del proyecto como directorio de trabajo, la app la mantenía ocupada (no se podía expulsar un USB)
+    c.current_dir(if cfg!(windows) { std::env::temp_dir() } else { "/".into() });
+    c.stdin(Stdio::null()).stdout(app_log()).stderr(app_log())
         .spawn().map(|_| ()).map_err(|e| format!("no se pudo lanzar {}: {e}", app.display()))
 }
 
-/// Abre el pipe. Si nadie escucha y hay `app`, la lanza y reintenta hasta 3 s.
-pub fn open(pipe: &str, app: Option<&Path>) -> Result<File, String> {
+/// Si nadie escucha: se lanza la app, salvo que se haya lanzado hace poco. Hace menos de 10 s otro hook la está abriendo
+/// (se espera sin lanzar otra); entre 10 y 60 s no arrancó (sin pantalla, falta una librería): cada hook la relanzaba,
+/// esperaba 3 s y dejaba otro error en app.log. Se reintenta pasado el minuto.
+fn launch(app: &Path) -> Result<(), String> {
+    match last_launch() {
+        Some(t) if t < Duration::from_secs(10) => Ok(()),
+        Some(t) if t < Duration::from_secs(60) => Err("la app no arrancó hace poco (ver ~/.claude/pulse/app.log)".into()),
+        _ => spawn_app(app),
+    }
+}
+
+/// Abre la conexión. Si nadie escucha y hay `app`, la lanza y reintenta hasta 3 s.
+pub fn open(pipe: &str, app: Option<&Path>) -> Result<Conn, String> {
     match try_open(pipe) {
-        Ok(f) => return Ok(f),
-        Err(e) if e.raw_os_error() == Some(ERROR_FILE_NOT_FOUND) => match app { Some(a) => spawn_app(a)?, None => return Err("no hay servidor".into()) },
-        Err(e) if e.raw_os_error() == Some(ERROR_PIPE_BUSY) => {}
-        Err(e) => return Err(e.to_string()),
+        Try::Ok(f) => return Ok(f),
+        Try::NoServer => match app { Some(a) => launch(a)?, None => return Err("no hay servidor".into()) },
+        Try::Busy => {}
+        Try::Err(e) => return Err(e),
     }
     let deadline = Instant::now() + Duration::from_millis(3000);
     while Instant::now() < deadline {
         thread::sleep(Duration::from_millis(80));
-        if let Ok(f) = try_open(pipe) { return Ok(f); }
+        if let Try::Ok(f) = try_open(pipe) { return Ok(f); }
     }
-    Err("la app no respondió".into())
+    Err("la app no respondió (ver ~/.claude/pulse/app.log)".into())
 }
 
 pub fn send_line(pipe: &str, line: &str, app: Option<&Path>) -> Result<(), String> {
@@ -48,13 +126,16 @@ mod tests {
     use super::*;
     use std::io::{BufRead, BufReader, Read, Write};
 
+    #[cfg(windows)] fn name(tag: &str) -> String { format!(r"\\.\pipe\pulse-test-{tag}-{}", std::process::id()) }
+    #[cfg(unix)] fn name(tag: &str) -> String { std::env::temp_dir().join(format!("pulse-test-{tag}-{}.sock", std::process::id())).to_string_lossy().into_owned() }
+
     #[test] fn gives_up_fast_without_server_or_app() {
         let t = std::time::Instant::now();
-        assert!(send_line(r"\\.\pipe\pulse-test-nadie", "{}\n", None).is_err());
+        assert!(send_line(&name("nadie"), "{}\n", None).is_err());
         assert!(t.elapsed().as_millis() < 500);
     }
     #[test] fn send_line_writes_to_listener() {
-        let name = format!(r"\\.\pipe\pulse-test-w-{}", std::process::id());
+        let name = name("w");
         let srv = test_server::create(&name);
         let n = name.clone();
         let h = std::thread::spawn(move || send_line(&n, "hola\n", None));
@@ -64,7 +145,7 @@ mod tests {
         assert_eq!(buf, "hola\n");
     }
     #[test] fn request_reads_the_reply_line() {
-        let name = format!(r"\\.\pipe\pulse-test-r-{}", std::process::id());
+        let name = name("r");
         let srv = test_server::create(&name);
         let n = name.clone();
         let h = std::thread::spawn(move || request(&n, "pregunta\n", None, std::time::Duration::from_secs(2)));
@@ -76,7 +157,7 @@ mod tests {
         assert_eq!(h.join().unwrap().as_deref(), Some(r#"{"decision":"allow"}"#));
     }
     #[test] fn request_times_out_quietly() {
-        let name = format!(r"\\.\pipe\pulse-test-t-{}", std::process::id());
+        let name = name("t");
         let srv = test_server::create(&name);
         let n = name.clone();
         let h = std::thread::spawn(move || request(&n, "x\n", None, std::time::Duration::from_millis(300)));
@@ -85,7 +166,7 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
 mod test_server {
     use std::{fs::File, os::windows::io::FromRawHandle};
     use windows_sys::Win32::{Storage::FileSystem::PIPE_ACCESS_DUPLEX, System::Pipes::*};
@@ -100,4 +181,11 @@ mod test_server {
         unsafe { ConnectNamedPipe(s.0 as _, std::ptr::null_mut()) };
         unsafe { File::from_raw_handle(s.0 as _) }
     }
+}
+
+#[cfg(all(test, unix))]
+mod test_server {
+    use std::os::unix::net::{UnixListener, UnixStream};
+    pub fn create(name: &str) -> UnixListener { let _ = std::fs::remove_file(name); UnixListener::bind(name).unwrap() }
+    pub fn accept(s: &UnixListener) -> UnixStream { s.accept().unwrap().0 }
 }
